@@ -289,7 +289,8 @@
         <span>交互预览</span>
       </label>
       <button id="btn-reset" disabled>↺ 重置</button>
-      <button id="btn-save" disabled>💾 保存</button>
+      <button id="btn-save" disabled>保存</button>
+      <button id="btn-save-as" disabled>另存</button>
     </header>
     <main class="canvas">
       <div class="placeholder" id="placeholder">
@@ -299,7 +300,7 @@
       </div>
       <iframe id="viewer" sandbox="allow-same-origin"></iframe>
       <div class="edit-hint" id="edit-hint">
-        点文字改文字 · 点元素空白处改背景/文字色 · 完成后点「保存」下载
+        点文字改文字 · 点元素空白处改背景/文字色 · 完成后点「保存」覆盖原文件或点「另存」下载
       </div>
     </main>
   </div>
@@ -342,6 +343,7 @@
     const state = {
       originalHTML: '',
       currentFileName: '',
+      fileHandle: null,
       isEditMode: false,
       allowScripts: false,
       selectedElement: null,
@@ -351,10 +353,19 @@
       isSaving: false,
     };
 
+    let persistTimer = null;
+    let pendingScroll = null;
+
+    const DB_NAME = 'html-editor-db';
+    const DB_VERSION = 1;
+    const STORE_NAME = 'state';
+    const STATE_KEY = 'editorState';
+
     const $ = id => document.getElementById(id);
     const fileInput = $('file-input');
     const btnOpen = $('btn-open');
     const btnSave = $('btn-save');
+    const btnSaveAs = $('btn-save-as');
     const btnReset = $('btn-reset');
     const toggleEdit = $('toggle-edit');
     const toggleScripts = $('toggle-scripts');
@@ -397,9 +408,124 @@
       });
     }
 
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onupgradeneeded = e => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    async function dbPut(value) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.put(value);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function dbGet(key) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function persistState() {
+      const doc = viewer.contentDocument;
+      let scrollTop = 0;
+      let scrollLeft = 0;
+      if (doc) {
+        const win = viewer.contentWindow;
+        scrollTop = win.scrollY || win.pageYOffset || doc.documentElement.scrollTop || doc.body.scrollTop || 0;
+        scrollLeft = win.scrollX || win.pageXOffset || doc.documentElement.scrollLeft || doc.body.scrollLeft || 0;
+      }
+      const currentHTML = await getEditedHTML();
+      const payload = {
+        id: STATE_KEY,
+        originalHTML: state.originalHTML,
+        currentHTML,
+        currentFileName: state.currentFileName,
+        isDirty: state.isDirty,
+        scrollTop,
+        scrollLeft,
+        fileHandle: state.fileHandle || null,
+      };
+      try {
+        await dbPut(payload);
+      } catch (err) {
+        // 如果 fileHandle 无法被结构化克隆（例如非原生 handle 测试），则不带 handle 重试
+        if (err && err.name === 'DataCloneError' && payload.fileHandle) {
+          payload.fileHandle = null;
+          await dbPut(payload);
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    function schedulePersistState() {
+      if (persistTimer) clearTimeout(persistTimer);
+      persistTimer = setTimeout(() => {
+        persistState().catch(err => console.error('持久化失败', err));
+      }, 400);
+    }
+
+    async function restoreSession() {
+      try {
+        const data = await dbGet(STATE_KEY);
+        if (!data || !data.currentHTML) return;
+
+        state.originalHTML = data.originalHTML || '';
+        state.currentFileName = data.currentFileName || '';
+        state.isDirty = !!data.isDirty;
+        state.fileHandle = data.fileHandle || null;
+
+        fileName.textContent = state.currentFileName;
+        updateStatus();
+
+        if (state.fileHandle) {
+          try {
+            const perm = await state.fileHandle.requestPermission({ mode: 'readwrite' });
+            if (perm !== 'granted') {
+              state.fileHandle = null;
+            }
+          } catch (e) {
+            state.fileHandle = null;
+          }
+        }
+
+        if (state.currentFileName) {
+          btnSaveAs.disabled = false;
+          btnReset.disabled = false;
+          toggleEdit.disabled = false;
+          toggleScripts.disabled = false;
+        }
+
+        pendingScroll = { top: data.scrollTop || 0, left: data.scrollLeft || 0 };
+        loadIntoIframe(data.currentHTML);
+      } catch (err) {
+        console.error('恢复会话失败', err);
+      }
+    }
+
     function setDirty(isDirty) {
       state.isDirty = isDirty;
       updateStatus();
+      schedulePersistState();
     }
 
     function updateStatus() {
@@ -413,11 +539,35 @@
       statusBadge.textContent = state.isDirty ? '有修改' : '未修改';
     }
 
-    btnOpen.addEventListener('click', () => fileInput.click());
+    btnOpen.addEventListener('click', async () => {
+      if (window.showOpenFilePicker) {
+        try {
+          const [handle] = await window.showOpenFilePicker({
+            types: [{
+              description: 'HTML 文件',
+              accept: { 'text/html': ['.html', '.htm'] }
+            }]
+          });
+          const file = await handle.getFile();
+          state.fileHandle = handle;
+          loadFile(file);
+        } catch (err) {
+          if (err.name !== 'AbortError') {
+            console.error(err);
+            alert('打开文件失败: ' + err.message);
+          }
+        }
+      } else {
+        fileInput.click();
+      }
+    });
 
     fileInput.addEventListener('change', e => {
       const file = e.target.files[0];
-      if (file) loadFile(file);
+      if (file) {
+        state.fileHandle = null;
+        loadFile(file);
+      }
       fileInput.value = '';
     });
 
@@ -427,12 +577,14 @@
         state.originalHTML = e.target.result;
         state.currentFileName = file.name;
         fileName.textContent = file.name;
-        btnSave.disabled = false;
+        btnSaveAs.disabled = false;
+        btnSave.disabled = !state.fileHandle;
         btnReset.disabled = false;
         toggleEdit.disabled = false;
         toggleScripts.disabled = false;
         setDirty(false);
         loadIntoIframe(state.originalHTML);
+        persistState();
       };
       reader.onerror = () => alert('读取文件失败: ' + file.name);
       reader.readAsText(file, 'utf-8');
@@ -473,52 +625,119 @@
       return html;
     }
 
+    async function getEditedHTML() {
+      const doc = viewer.contentDocument;
+      if (!doc) return state.originalHTML;
+      const clone = doc.documentElement.cloneNode(true);
+      await inlineLoadedImages(doc, clone);
+      const clonedBody = clone.querySelector('body');
+      if (clonedBody) {
+        clonedBody.removeAttribute('contenteditable');
+        clonedBody.style.cursor = '';
+      }
+      let html = clone.outerHTML;
+      if (!/^<!DOCTYPE/i.test(html)) {
+        html = '<!DOCTYPE html>\n' + html;
+      }
+      return html;
+    }
+
     viewer.addEventListener('load', () => {
       if (viewer.srcdoc) {
         state.iframeReady = true;
         if (state.isEditMode) bindEditModeEvents();
+        const win = viewer.contentWindow;
+        if (win) {
+          win.addEventListener('scroll', schedulePersistState, { passive: true });
+          if (pendingScroll) {
+            win.scrollTo(pendingScroll.left, pendingScroll.top);
+            pendingScroll = null;
+          }
+        }
       }
     });
 
     btnSave.addEventListener('click', saveFile);
+    btnSaveAs.addEventListener('click', saveAsFile);
 
     async function saveFile() {
       if (!state.iframeReady || state.isSaving) return;
-      const doc = viewer.contentDocument;
-      if (!doc) return;
-      const previousSaveText = btnSave.textContent;
+      if (!state.fileHandle) {
+        alert('无法覆盖原文件，请通过「打开 HTML」选择文件。');
+        return;
+      }
+      const previousText = btnSave.textContent;
       state.isSaving = true;
       btnSave.disabled = true;
+      btnSaveAs.disabled = true;
       btnSave.textContent = '保存中...';
       try {
-        // 克隆一份再清理,避免影响活的 DOM(保留用户的光标位置)
-        const clone = doc.documentElement.cloneNode(true);
-        await inlineLoadedImages(doc, clone);
-        const clonedBody = clone.querySelector('body');
-        if (clonedBody) {
-          clonedBody.removeAttribute('contenteditable');
-          // 移除编辑器可能加在 body 上的 inline 样式
-          clonedBody.style.cursor = '';
-        }
-        let html = clone.outerHTML;
-        if (!/^<!DOCTYPE/i.test(html)) {
-          html = '<!DOCTYPE html>\n' + html;
-        }
-        const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        const baseName = state.currentFileName.replace(/\.html?$/i, '') || 'untitled';
-        a.download = baseName + '-edited.html';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        const html = await getEditedHTML();
+        const writable = await state.fileHandle.createWritable();
+        await writable.write(html);
+        await writable.close();
+        state.originalHTML = html;
         setDirty(false);
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (err) {
+        alert('保存失败: ' + err.message);
       } finally {
         state.isSaving = false;
-        btnSave.disabled = false;
-        btnSave.textContent = previousSaveText;
+        btnSave.disabled = !state.fileHandle;
+        btnSaveAs.disabled = false;
+        btnSave.textContent = previousText;
+        persistState();
+      }
+    }
+
+    async function saveAsFile() {
+      if (!state.iframeReady || state.isSaving) return;
+      const previousText = btnSaveAs.textContent;
+      state.isSaving = true;
+      btnSave.disabled = true;
+      btnSaveAs.disabled = true;
+      btnSaveAs.textContent = '保存中...';
+      try {
+        const html = await getEditedHTML();
+        if (window.showSaveFilePicker) {
+          const suggested = state.currentFileName.replace(/\.html?$/i, '') + '-edited.html';
+          const handle = await window.showSaveFilePicker({
+            suggestedName: suggested,
+            types: [{
+              description: 'HTML 文件',
+              accept: { 'text/html': ['.html', '.htm'] }
+            }]
+          });
+          const writable = await handle.createWritable();
+          await writable.write(html);
+          await writable.close();
+          state.fileHandle = handle;
+          state.currentFileName = handle.name;
+          fileName.textContent = handle.name;
+          state.originalHTML = html;
+          setDirty(false);
+        } else {
+          const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          const baseName = state.currentFileName.replace(/\.html?$/i, '') || 'untitled';
+          a.download = baseName + '-edited.html';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setDirty(false);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          alert('另存失败: ' + err.message);
+        }
+      } finally {
+        state.isSaving = false;
+        btnSave.disabled = !state.fileHandle;
+        btnSaveAs.disabled = false;
+        btnSaveAs.textContent = previousText;
+        persistState();
       }
     }
 
@@ -594,6 +813,7 @@
       document.querySelector('.canvas').classList.remove('drag-over');
       const file = e.dataTransfer.files[0];
       if (file && /\.html?$/i.test(file.name)) {
+        state.fileHandle = null;
         loadFile(file);
       } else if (file) {
         alert('请拖入 .html 或 .htm 文件');
@@ -791,7 +1011,10 @@
 
       const handleDrop = (e) => e.preventDefault();
       const handleDragOver = (e) => e.preventDefault();
-      const handleScrollOrResize = () => refreshFloatingUI();
+      const handleScrollOrResize = () => {
+        refreshFloatingUI();
+        schedulePersistState();
+      };
 
       doc.addEventListener('mousemove', handleMouseMove, true);
       doc.addEventListener('mouseleave', handleMouseLeave, true);
@@ -1113,10 +1336,23 @@
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
         if (!btnSave.disabled) saveFile();
+        else if (!btnSaveAs.disabled) saveAsFile();
+      }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (persistTimer) clearTimeout(persistTimer);
+      persistState();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        if (persistTimer) clearTimeout(persistTimer);
+        persistState();
       }
     });
 
     initSwatches();
+    restoreSession();
   })();
   </script>
 </body>
